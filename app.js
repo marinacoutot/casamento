@@ -27,7 +27,8 @@ const STATUS = [
   ['fechado', 'Fechado'],
   ['descartado', 'Descartado'],
 ];
-const FORMAS = ['Pix', 'Boleto', 'Cartão de crédito', 'Transferência', 'Dinheiro'];
+const CARTAO = 'Cartão de crédito';
+const FORMAS = ['Pix', 'Boleto', CARTAO, 'Transferência', 'Dinheiro'];
 
 // ---------- utilidades ----------
 const $ = (s, el = document) => el.querySelector(s);
@@ -793,6 +794,10 @@ function formParcelas(f) {
       <label class="f"><span>Data da entrada</span><input name="dataEntrada" type="date" value="${hojeISO()}"></label>
       <label class="f"><span>Forma</span><select name="formaEntrada">${optFormas('')}</select></label>
     </div>
+    <div class="row" id="cartaoE">
+      <label class="f"><span>Entrada em quantas vezes no cartão</span><input name="nCartaoE" type="number" min="1" value="1"></label>
+      <label class="f"><span>Vencimento da 1ª fatura</span><input name="faturaE" type="date" value="${addMeses(hojeISO(), 1)}"></label>
+    </div>
     <div class="row3">
       <label class="f"><span>Nº de parcelas</span><input name="n" type="number" min="0" value="1"></label>
       <label class="f"><span>1ª parcela</span><input name="primeira" type="date" value="${addMeses(hojeISO(), 1)}"></label>
@@ -808,22 +813,33 @@ function formParcelas(f) {
     });
   const prev = () => {
     const fd = Object.fromEntries(new FormData(form));
+    $('#cartaoE').classList.toggle('hidden', fd.formaEntrada !== CARTAO);
     const ps = calcParcelas(fd);
     $('#prev').innerHTML = ps.length ? ps.map(p => `${fmtData(p.vencimento)} · ${esc(p.descricao)} · <b class="num">${brl(p.valor)}</b>`).join('<br>') : 'Preencha total e parcelas.';
   };
   form.oninput = prev; prev();
 }
+// divide em n valores com centavos exatos (a última parcela absorve a sobra)
+function dividir(total, n) {
+  const base = Math.floor(total / n * 100) / 100;
+  return Array.from({ length: n }, (_, i) => i === n - 1 ? r2(total - base * (n - 1)) : base);
+}
+// compra no cartão parcelada: uma saída por fatura, mês a mês
+function faturasCartao(valor, n, primeiraFatura, descricao) {
+  return dividir(valor, n).map((v, i) => ({ descricao: `${descricao} · cartão ${i + 1}/${n}`, valor: v, vencimento: addMeses(primeiraFatura, i), forma: CARTAO }));
+}
 function calcParcelas(fd) {
   const total = parseValor(fd.total), entrada = Math.min(parseValor(fd.entrada), total), n = Math.max(0, parseInt(fd.n) || 0);
   const out = [];
-  if (entrada > 0) out.push({ descricao: 'Entrada', valor: entrada, vencimento: fd.dataEntrada || hojeISO(), forma: fd.formaEntrada });
+  if (entrada > 0) {
+    const nc = parseInt(fd.nCartaoE) || 1;
+    if (fd.formaEntrada === CARTAO && nc > 1 && fd.faturaE) out.push(...faturasCartao(entrada, nc, fd.faturaE, 'Entrada'));
+    else out.push({ descricao: 'Entrada', valor: entrada, vencimento: fd.dataEntrada || hojeISO(), forma: fd.formaEntrada });
+  }
   const resto = r2(total - entrada);
   if (n > 0 && resto > 0 && fd.primeira) {
-    const base = Math.floor(resto / n * 100) / 100;
-    for (let i = 0; i < n; i++) {
-      const valor = i === n - 1 ? r2(resto - base * (n - 1)) : base;
-      out.push({ descricao: n === 1 ? (entrada ? 'Saldo' : 'Pagamento único') : `Parcela ${i + 1}/${n}`, valor, vencimento: addMeses(fd.primeira, i), forma: fd.forma });
-    }
+    dividir(resto, n).forEach((valor, i) =>
+      out.push({ descricao: n === 1 ? (entrada ? 'Saldo' : 'Pagamento único') : `Parcela ${i + 1}/${n}`, valor, vencimento: addMeses(fd.primeira, i), forma: fd.forma }));
   }
   return out;
 }
@@ -843,7 +859,12 @@ function formPagamento(p, fornecedor) {
       <label class="f"><span>Vencimento</span><input name="vencimento" type="date" required value="${esc(p.vencimento)}"></label>
       <label class="f"><span>Forma</span><select name="forma">${optFormas(p.forma)}</select></label>
     </div>
-    <div class="row">
+    ${novo ? `<div class="row" id="lcartao">
+      <label class="f"><span>Em quantas vezes no cartão</span><input name="nCartao" type="number" min="1" value="1"></label>
+      <label class="f"><span>Vencimento da 1ª fatura</span><input name="fatura" type="date" value="${addMeses(hojeISO(), 1)}"></label>
+    </div>
+    <div class="alert green hidden" id="prevCartao"></div>` : ''}
+    <div class="row" id="lpago">
       <label class="f" style="display:flex;align-items:center;gap:8px"><input type="checkbox" name="pago" ${p.pago ? 'checked' : ''}> Já pago</label>
       <label class="f"><span>Pago em</span><input name="pagoEm" type="date" value="${esc(p.pagoEm)}"></label>
     </div>`,
@@ -854,13 +875,34 @@ function formPagamento(p, fornecedor) {
         valor: parseValor(fd.valor), vencimento: fd.vencimento, forma: fd.forma, pago: fd.pago, pagoEm: fd.pago ? (fd.pagoEm || hojeISO()) : '',
       };
       if (!v.valor) { toast('Informe o valor', true); return false; }
+      const nc = parseInt(fd.nCartao) || 1;
+      if (novo && v.forma === CARTAO && nc > 1) {
+        if (!fd.fatura) { toast('Informe o vencimento da 1ª fatura', true); return false; }
+        const fats = faturasCartao(v.valor, nc, fd.fatura, v.descricao || 'Compra');
+        for (const f of fats) S.data.pagamentos.push({ id: uid(), ...v, ...f, pago: false, pagoEm: '' });
+        salvar(`lança compra em ${nc}x no cartão`); render(); toast(`${nc} faturas lançadas`);
+        return;
+      }
       if (novo) S.data.pagamentos.push({ id: uid(), ...v }); else Object.assign(p, v);
       salvar(novo ? 'novo pagamento' : 'edita pagamento'); render();
     },
     novo ? null : () => { S.data.pagamentos = S.data.pagamentos.filter(x => x.id !== p.id); salvar('exclui pagamento'); render(); });
   const sel = form.querySelector('[name=fornecedorId]');
-  const sync = () => $('#lcat').classList.toggle('hidden', !!sel.value);
-  sel.onchange = sync; sync();
+  const sync = () => {
+    $('#lcat').classList.toggle('hidden', !!sel.value);
+    if (!novo) return;
+    const fd = Object.fromEntries(new FormData(form));
+    const cartao = fd.forma === CARTAO, nc = parseInt(fd.nCartao) || 1, emVezes = cartao && nc > 1;
+    $('#lcartao').classList.toggle('hidden', !cartao);
+    $('#lpago').classList.toggle('hidden', emVezes);
+    // com parcelamento no cartão, o vencimento que vale é o das faturas
+    form.querySelector('[name=vencimento]').closest('label').classList.toggle('hidden', emVezes);
+    form.querySelector('[name=vencimento]').required = !emVezes;
+    const pv = $('#prevCartao'), valor = parseValor(fd.valor);
+    pv.classList.toggle('hidden', !(emVezes && valor && fd.fatura));
+    if (emVezes && valor && fd.fatura) pv.innerHTML = `${nc} faturas de <b class="num">${brl(dividir(valor, nc)[0])}</b>, de ${fmtMes(mesDe(fd.fatura))} a ${fmtMes(mesDe(addMeses(fd.fatura, nc - 1)))}`;
+  };
+  form.oninput = sync; sel.onchange = sync; sync();
 }
 
 function formCategoria(c) {
